@@ -1,0 +1,12 @@
+numpy
+pandas==1.5.3
+selenium
+openpyxl
+requests
+bs4
+beautifulsoup4
+lxml
+html5lib
+webdriver-manager
+jupyter
+ipykernel
