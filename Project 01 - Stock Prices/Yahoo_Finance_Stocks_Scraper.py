@@ -1,177 +1,376 @@
-################################ Scraping the most active stocks from Yahoo Finance Website ###############################################
-############ Steps Taken:
-# 1. Open the browser and maximize the window
-# 2. Initialize explicit wait instance
-# 3. Visit the target URL: https://finance.yahoo.com/ and wait for page to load
-# 4. Hover over the Markets menu
-# 5. Click on Trending Tickers
-# 6. Click on Most Active
-# 7. Extracted the stocks data from webpage as dictionaries
-# 8. Navigated until the last page for more data to ensure that the all the pages of stocks has been visited.
-# 9. Stored the extracted data in a list
-# 10. Close the browser
-# 11. Clean the extracted data
-# 12. Export the cleaned data as an Excel file
+#!/usr/bin/env python3
+"""
+yahoo_most_active_scraper.py
 
-############ Stocks Jargon:
-# Symbol:
-	# This is a unique identifier for a particular stock listed on a stock exchange
-	# Ticker symbols are essential for identifying and trading stocks
-# Price:
-	# The current trading price of the stock (in dollars)
-	# This is the most recent price at which the stock was bought/sold on the market
-# Change:
-	# The difference in the stock's current price compared to the previous day's closing price
-	# +ve change indicates the price of the stock has increased from the previous day
-	# -ve change indicates the price of the stock has decreased from the previous day
-# Volume:
-	# The total number of shares of the stock during the current trading session
-	# Indicates the trading activity of the stock.
-	# Higher volume usually means more interest in the stock
-# Market Cap:
-	# Represents the total value of a company in the stock market
-	# Ex: If a company has 1,000 shares and each costs $10, then the company's market value is $10,000'
-	# The larger the cap, the more stable the company usually is
-# PE Ratio:
-	# Price to Earnings ratio
-	# Can be thought of as the ratio of the CP of a stock to the SP of the stock
+Scrapes "Most Active" stocks from Yahoo Finance.
+
+Features:
+- Directly visits https://finance.yahoo.com/most-active for stability
+- Maps table columns by header text (robust to column reordering)
+- Handles paging until the Next button is disabled (or until pages_limit reached)
+- Parses Price, Change, Volume, Market Cap, PE
+- Saves to Excel, CSV, and JSON (raw)
+- Supports headless mode and basic CLI options
+
+Dependencies:
+- selenium
+- pandas
+- openpyxl (for Excel)
+"""
 
 import time
-import numpy as np
+import random
+import logging
+import argparse
+import json
+from datetime import datetime
+from typing import List, Dict, Optional
+
 import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import (
+    TimeoutException,
+    NoSuchElementException,
+    StaleElementReferenceException,
+    ElementClickInterceptedException,
+)
 
-class StocksScraper:
-	def __init__(self, driver, timeout=10):
-		self.driver = driver
-		self.wait = WebDriverWait(self.driver, timeout=timeout) # explicit wait
-		self.data = []
-
-    # wait while webpage loads
-	def wait_for_page_to_load(self):
-		page_title = self.driver.title
-		try:
-			self.wait.until(
-				lambda d: d.execute_script("return document.readyState") == "complete"
-			)
-		except:
-			print(f"The page \"{page_title}\" did not get fully loaded within the given duration.\n")
-		else:
-			print(f"The page \"{page_title}\" is fully loaded.\n")
-
-	
-    # access main url
-	def access_url(self, url):
-		self.driver.get(url)
-		self.wait_for_page_to_load()
+# -------------------------
+# Logging configuration
+# -------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 
-    # access most active stocks webpage
-	def access_most_active_stocks(self):
-		# hover to markets menu
-		actions = ActionChains(self.driver)
-		markets_menu = self.wait.until(
-			EC.presence_of_element_located((By.XPATH, '/html[1]/body[1]/div[2]/header[1]/div[1]/div[1]/div[1]/div[4]/div[1]/div[1]/ul[1]/li[3]/a[1]/span[1]'))
-		)
-		actions.move_to_element(markets_menu).perform()
-		
-		# click on Trending Tickers
-		trending_tickers = self.wait.until(
-			EC.element_to_be_clickable((By.XPATH, '/html[1]/body[1]/div[2]/header[1]/div[1]/div[1]/div[1]/div[4]/div[1]/div[1]/ul[1]/li[3]/div[1]/ul[1]/li[4]/a[1]/div[1]'))
-		)
-		trending_tickers.click()
-		self.wait_for_page_to_load()
-		
-		# click on Most Active
-		most_active = self.wait.until(
-			EC.element_to_be_clickable((By.XPATH, '/html[1]/body[1]/div[2]/main[1]/section[1]/section[1]/section[1]/article[1]/section[1]/div[1]/nav[1]/ul[1]/li[1]/a[1]/span[1]'))
-		)
-		most_active.click()
-		self.wait_for_page_to_load()
-
-    
-    # extract data from all pages
-	def extract_stocks_data(self):
-		# extract data from webpage
-		while True:
-			self.wait.until(
-				EC.presence_of_element_located((By.TAG_NAME, "table"))
-			)
-			rows = self.driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
-			for row in rows:
-				values = row.find_elements(By.TAG_NAME, "td")
-				stock = {
-					"name": values[1].text,
-					"symbol": values[0].text,
-					"price": values[3].text,
-					"change": values[4].text,
-					"volume": values[6].text,
-					"market_cap": values[8].text,
-					"pe_ratio": values[9].text,
-				}
-				self.data.append(stock)
-		
-			# click next
-			try:
-				next_button = self.wait.until(
-					EC.element_to_be_clickable((By.XPATH, '//*[@id="nimbus-app"]/section/section/section/article/section[1]/div/div[3]/div[3]/button[3]'))
-				)
-			except:
-				print("The \"next\" button is not clickable. We have navigated through all the pages.")
-				break
-			else:
-				next_button.click()
-				time.sleep(1)
+# -------------------------
+# Helpers for parsing
+# -------------------------
+def _clean_text(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    return s.strip()
 
 
-# Cleaning the Data using Method Chaining in Pandas
-	def clean_and_save_data(self, filename="temp"):
-		stocks_df = (
-			pd
-			.DataFrame(self.data)
-			.apply(lambda col: col.str.strip() if col.dtype == "object" else col)# to remove the l and t extra spaces
-			# .price.str.extract(r'([^0-9.])',expand=False).unique() # to check if some string is present in the data or not. It takes group
-			# the above-one is used to varify that do anything other than 0 to 9 and . is present in the price column
-			# .volume.str[-1].unique() # to check unique values at the last
-			# .dtypes # tell the data types and the datatype is object (object in pandas means string)
-			.assign(
-				price=lambda df_: pd.to_numeric(df_.price),
-				change=lambda df_: pd.to_numeric(df_.change.str.replace("+", "")),
-				volume=lambda df_: pd.to_numeric(df_.volume.str.replace("M", "")),
-				market_cap=lambda df_: df_.market_cap.apply(lambda val: float(val.replace("B", "")) if "B" in val else float(val.replace("T", "")) * 1000),
-				pe_ratio=lambda df_: (
-					df_
-					.pe_ratio
-					.replace("-", np.nan)
-					.str.replace(",", "")
-					.pipe(lambda col: pd.to_numeric(col))
-				)
-			)
-			.rename(columns={
-				"price": "price_usd",
-				"volume": "volume_M", # volume in Millions
-				"market_cap": "market_cap_B" # market cap in Billions (trillions has been converted into billions)
-			})
-		)
-		# to check datatype
-		# print(stocks_df.dtypes)
-		stocks_df.to_excel(f"{filename}.xlsx", index=False)
+def parse_number_with_suffix(s: str) -> Optional[float]:
+    """
+    Parse numbers like "1.23M", "4,567", "2.1B", "0.45T", "—" etc.
+    Returns float value in base units (for volume we keep as raw units unless caller multiplies).
+    """
+    if not s:
+        return None
+    s = s.strip().replace(",", "")
+    if s in {"-", "—", "N/A", ""}:
+        return None
+    try:
+        # Handle percentages or values with % (used rarely for the change column)
+        if s.endswith("%"):
+            return float(s[:-1])
+        # Suffix handling
+        mult = 1.0
+        if s.endswith("K"):
+            mult = 1e3
+            s = s[:-1]
+        elif s.endswith("M"):
+            mult = 1e6
+            s = s[:-1]
+        elif s.endswith("B"):
+            mult = 1e9
+            s = s[:-1]
+        elif s.endswith("T"):
+            mult = 1e12
+            s = s[:-1]
+        # handle +/- signs
+        s = s.replace("+", "")
+        return float(s) * mult
+    except ValueError:
+        # Last resort: try to parse as float
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+
+def parse_price(s: str) -> Optional[float]:
+    # sometimes price contains commas or other chars
+    if not s:
+        return None
+    s = s.replace(",", "").strip()
+    try:
+        return float(s)
+    except ValueError:
+        return parse_number_with_suffix(s)
+
+
+def parse_change(s: str) -> Optional[float]:
+    # might be like "+1.23" or "-0.45" or "+1.23 (+0.25%)" — we take the first numeric part
+    if not s:
+        return None
+    parts = s.split()
+    # prefer the plain numeric token (with + or -)
+    for token in parts:
+        token = token.strip().replace(",", "")
+        if token.endswith("%"):
+            token = token[:-1]
+        try:
+            return float(token.replace("+", ""))
+        except Exception:
+            continue
+    return None
+
+
+# -------------------------
+# Scraper class
+# -------------------------
+class YahooMostActiveScraper:
+    MOST_ACTIVE_URL = "https://finance.yahoo.com/most-active"
+
+    def __init__(self, driver: webdriver.Chrome, wait_timeout: int = 10, polite: bool = True):
+        self.driver = driver
+        self.wait = WebDriverWait(self.driver, wait_timeout)
+        self.data: List[Dict] = []
+        self.polite = polite
+
+    def open_page(self, url: str):
+        logger.info("Opening URL: %s", url)
+        self.driver.get(url)
+        self._wait_for_ready_state()
+        # small polite wait for dynamic content
+        time.sleep(0.5 + random.random() * 0.5)
+
+    def _wait_for_ready_state(self, timeout: int = 10):
+        try:
+            self.wait.until(lambda d: d.execute_script("return document.readyState === 'complete'"))
+        except TimeoutException:
+            logger.warning("Page did not reach readyState 'complete' within timeout")
+
+    def _find_table_and_headers(self):
+        # wait for table presence
+        try:
+            table = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
+        except TimeoutException:
+            raise RuntimeError("No table found on the page")
+        # find headers
+        header_elems = table.find_elements(By.CSS_SELECTOR, "thead th")
+        headers = [h.text.strip() for h in header_elems]
+        # mapping header name (lowercase) -> index
+        header_map = {}
+        for idx, h in enumerate(headers):
+            key = h.lower()
+            header_map[key] = idx
+        return table, header_map
+
+    def _extract_rows_by_header_map(self, table, header_map) -> List[Dict]:
+        rows = table.find_elements(By.CSS_SELECTOR, "tbody tr")
+        page_records = []
+        for row in rows:
+            try:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                # safe-get helper
+                def g(idx):
+                    try:
+                        return _clean_text(cells[idx].text)
+                    except Exception:
+                        return None
+
+                # Attempt to find by common header names (fallback to indices if present)
+                # The header_map keys are whole header text lowercased; we check substrings for robustness
+                def find_index_by_keyword(keywords):
+                    for k, idx in header_map.items():
+                        for kw in keywords:
+                            if kw in k:
+                                return idx
+                    return None
+
+                symbol_idx = find_index_by_keyword(["symbol"]) or 0
+                name_idx = find_index_by_keyword(["name", "title"]) or 1
+                price_idx = find_index_by_keyword(["price", "last"]) or None
+                change_idx = find_index_by_keyword(["change", "% change"]) or None
+                volume_idx = find_index_by_keyword(["volume"]) or None
+                marketcap_idx = find_index_by_keyword(["market cap", "marketcap"]) or None
+                pe_idx = find_index_by_keyword(["pe", "pe ratio"]) or None
+
+                # Build record gracefully
+                symbol = g(symbol_idx) if symbol_idx is not None else None
+                name = g(name_idx) if name_idx is not None else None
+                price_raw = g(price_idx) if price_idx is not None else None
+                change_raw = g(change_idx) if change_idx is not None else None
+                volume_raw = g(volume_idx) if volume_idx is not None else None
+                marketcap_raw = g(marketcap_idx) if marketcap_idx is not None else None
+                pe_raw = g(pe_idx) if pe_idx is not None else None
+
+                record = {
+                    "symbol": symbol,
+                    "name": name,
+                    "price_raw": price_raw,
+                    "change_raw": change_raw,
+                    "volume_raw": volume_raw,
+                    "market_cap_raw": marketcap_raw,
+                    "pe_raw": pe_raw,
+                    "scraped_at": datetime.utcnow().isoformat() + "Z",
+                }
+
+                # parsed numeric values
+                record["price_usd"] = parse_price(price_raw) if price_raw else None
+                record["change"] = parse_change(change_raw) if change_raw else None
+                record["volume"] = parse_number_with_suffix(volume_raw) if volume_raw else None
+                record["market_cap"] = parse_number_with_suffix(marketcap_raw) if marketcap_raw else None
+                # PE ratio may contain '-' for N/A
+                try:
+                    record["pe_ratio"] = float(pe_raw.replace(",", "")) if pe_raw and pe_raw not in {"-", "—", "N/A"} else None
+                except Exception:
+                    record["pe_ratio"] = None
+
+                page_records.append(record)
+            except StaleElementReferenceException:
+                logger.debug("Stale row skipped")
+                continue
+        return page_records
+
+    def _click_next_if_available(self) -> bool:
+        """
+        Return True if we clicked next and more pages are expected; False if Next is absent/disabled.
+        """
+        # There may be a pagination control under a div with buttons; try common attributes for Next
+        try:
+            next_btn = self.driver.find_element(By.XPATH, "//button[contains(@aria-label,'Next') or contains(., 'Next')]")
+        except NoSuchElementException:
+            logger.info("Next button not found on page.")
+            return False
+
+        # check if disabled
+        disabled_attr = next_btn.get_attribute("disabled")
+        classes = (next_btn.get_attribute("class") or "")
+        aria_disabled = next_btn.get_attribute("aria-disabled")
+        if disabled_attr or "disabled" in classes or aria_disabled == "true":
+            logger.info("Next button is disabled - reached last page.")
+            return False
+
+        # attempt to click with retry
+        try:
+            next_btn.click()
+            # wait a bit for the next page to load content
+            self._wait_for_ready_state()
+            time.sleep(0.5 + random.random() * 0.7)
+            return True
+        except (ElementClickInterceptedException, StaleElementReferenceException) as e:
+            logger.warning("Could not click Next directly (%s). Trying JS click...", e)
+            try:
+                self.driver.execute_script("arguments[0].click();", next_btn)
+                self._wait_for_ready_state()
+                time.sleep(0.5 + random.random() * 0.7)
+                return True
+            except Exception:
+                logger.exception("JS click on Next failed.")
+                return False
+
+    def scrape(self, pages_limit: Optional[int] = None):
+        """
+        Scrape pages until Next disabled or until pages_limit is reached (if provided).
+        """
+        # Open the target page
+        self.open_page(self.MOST_ACTIVE_URL)
+
+        pages_scraped = 0
+        while True:
+            pages_scraped += 1
+            logger.info("Scraping page %d ...", pages_scraped)
+            try:
+                table, header_map = self._find_table_and_headers()
+            except RuntimeError as e:
+                logger.error("Could not find table: %s", e)
+                break
+
+            page_records = self._extract_rows_by_header_map(table, header_map)
+            logger.info("Found %d rows on page %d", len(page_records), pages_scraped)
+            self.data.extend(page_records)
+
+            if pages_limit and pages_scraped >= pages_limit:
+                logger.info("Reached pages_limit (%s). Stopping.", pages_limit)
+                break
+
+            # Try to move to the next page
+            has_next = self._click_next_if_available()
+            if not has_next:
+                break
+
+        logger.info("Scraping completed. Total rows collected: %d", len(self.data))
+
+    def save(self, output_basename: str):
+        if not self.data:
+            logger.warning("No data to save.")
+            return
+        df = pd.DataFrame(self.data)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        excel_path = f"{output_basename}_{timestamp}.xlsx"
+        csv_path = f"{output_basename}_{timestamp}.csv"
+        json_path = f"{output_basename}_{timestamp}_raw.json"
+
+        # reorder columns sensibly
+        cols = [
+            "scraped_at", "symbol", "name",
+            "price_raw", "price_usd",
+            "change_raw", "change",
+            "volume_raw", "volume",
+            "market_cap_raw", "market_cap",
+            "pe_raw", "pe_ratio"
+        ]
+        cols = [c for c in cols if c in df.columns] + [c for c in df.columns if c not in cols]
+        df = df[cols]
+
+        df.to_excel(excel_path, index=False)
+        df.to_csv(csv_path, index=False)
+        # save raw json
+        with open(json_path, "w", encoding="utf-8") as fh:
+            json.dump(self.data, fh, ensure_ascii=False, indent=2)
+
+        logger.info("Saved Excel -> %s", excel_path)
+        logger.info("Saved CSV   -> %s", csv_path)
+        logger.info("Saved JSON  -> %s", json_path)
+
+
+# -------------------------
+# CLI Entrypoint
+# -------------------------
+def build_driver(headless: bool = True, window_size: str = "1280,1024"):
+    options = ChromeOptions()
+    if headless:
+        options.add_argument("--headless=new")
+    options.add_argument(f"--window-size={window_size}")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    # options.add_argument("--disable-gpu")  # usually not necessary on modern chrome
+    driver = webdriver.Chrome(options=options)
+    return driver
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Scrape Yahoo Finance - Most Active stocks")
+    parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
+    parser.add_argument("--pages", type=int, default=None, help="Max pages to scrape (default: all)")
+    parser.add_argument("--out", type=str, default="yahoo_most_active", help="Output filename base (no ext)")
+    args = parser.parse_args()
+
+    driver = build_driver(headless=args.headless)
+    try:
+        scraper = YahooMostActiveScraper(driver, wait_timeout=12)
+        scraper.scrape(pages_limit=args.pages)
+        scraper.save(args.out)
+    except Exception:
+        logger.exception("Unhandled exception during scraping.")
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-	driver = webdriver.Chrome()
-	driver.maximize_window()
-
-	url = "https://finance.yahoo.com/"
-	scraper = StocksScraper(driver, 5)
-
-	scraper.access_url(url)
-	scraper.access_most_active_stocks()
-	scraper.extract_stocks_data()
-	scraper.clean_and_save_data("Yahoo_Finance_Stocks")
-
-	driver.quit()
+    main()
