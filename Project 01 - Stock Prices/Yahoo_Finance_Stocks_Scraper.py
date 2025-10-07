@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-yahoo_most_active_scraper.py
+yahoo_most_active_scraper_enhanced.py
 
-Scrapes "Most Active" stocks from Yahoo Finance.
-
-Features:
-- Directly visits https://finance.yahoo.com/most-active for stability
-- Maps table columns by header text (robust to column reordering)
-- Handles paging until the Next button is disabled (or until pages_limit reached)
-- Parses Price, Change, Volume, Market Cap, PE
-- Saves to Excel, CSV, and JSON (raw)
-- Supports headless mode and basic CLI options
+Enhanced scraper for Yahoo Finance "Most Active" with optional enrichment
+from yfinance for technical indicators (Bollinger Bands, SMA, RSI) and
+additional fields. Also improves robustness when headers change.
 
 Dependencies:
 - selenium
 - pandas
-- openpyxl (for Excel)
+- openpyxl
+- yfinance
+
+Usage:
+    python yahoo_most_active_scraper_enhanced.py --out outbase --enrich --pages 2
+
+Notes:
+- yfinance enrichment can be slow and may hit rate limits; use --yf-delay to
+  increase delay between ticker requests.
+- This script tries to be robust to column reordering on the Yahoo table.
 """
 
 import time
@@ -27,6 +30,7 @@ from datetime import datetime
 from typing import List, Dict, Optional
 
 import pandas as pd
+import yfinance as yf
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -53,6 +57,7 @@ logger = logging.getLogger(__name__)
 # -------------------------
 # Helpers for parsing
 # -------------------------
+
 def _clean_text(s: Optional[str]) -> Optional[str]:
     if s is None:
         return None
@@ -60,20 +65,14 @@ def _clean_text(s: Optional[str]) -> Optional[str]:
 
 
 def parse_number_with_suffix(s: str) -> Optional[float]:
-    """
-    Parse numbers like "1.23M", "4,567", "2.1B", "0.45T", "—" etc.
-    Returns float value in base units (for volume we keep as raw units unless caller multiplies).
-    """
     if not s:
         return None
     s = s.strip().replace(",", "")
     if s in {"-", "—", "N/A", ""}:
         return None
     try:
-        # Handle percentages or values with % (used rarely for the change column)
         if s.endswith("%"):
             return float(s[:-1])
-        # Suffix handling
         mult = 1.0
         if s.endswith("K"):
             mult = 1e3
@@ -87,11 +86,9 @@ def parse_number_with_suffix(s: str) -> Optional[float]:
         elif s.endswith("T"):
             mult = 1e12
             s = s[:-1]
-        # handle +/- signs
         s = s.replace("+", "")
         return float(s) * mult
     except ValueError:
-        # Last resort: try to parse as float
         try:
             return float(s)
         except Exception:
@@ -99,7 +96,6 @@ def parse_number_with_suffix(s: str) -> Optional[float]:
 
 
 def parse_price(s: str) -> Optional[float]:
-    # sometimes price contains commas or other chars
     if not s:
         return None
     s = s.replace(",", "").strip()
@@ -110,11 +106,9 @@ def parse_price(s: str) -> Optional[float]:
 
 
 def parse_change(s: str) -> Optional[float]:
-    # might be like "+1.23" or "-0.45" or "+1.23 (+0.25%)" — we take the first numeric part
     if not s:
         return None
     parts = s.split()
-    # prefer the plain numeric token (with + or -)
     for token in parts:
         token = token.strip().replace(",", "")
         if token.endswith("%"):
@@ -124,6 +118,42 @@ def parse_change(s: str) -> Optional[float]:
         except Exception:
             continue
     return None
+
+
+# -------------------------
+# Technical indicator helpers (using pandas / yfinance data)
+# -------------------------
+
+def compute_sma(series: pd.Series, window: int) -> Optional[float]:
+    if series is None or len(series) < window:
+        return None
+    return float(series.rolling(window=window).mean().iloc[-1])
+
+
+def compute_bollinger(series: pd.Series, window: int = 20, num_std: int = 2):
+    if series is None or len(series) < window:
+        return (None, None, None)
+    rolling_mean = series.rolling(window=window).mean()
+    rolling_std = series.rolling(window=window).std()
+    last_mean = float(rolling_mean.iloc[-1])
+    last_std = float(rolling_std.iloc[-1])
+    upper = last_mean + num_std * last_std
+    lower = last_mean - num_std * last_std
+    return last_mean, upper, lower
+
+
+def compute_rsi(series: pd.Series, window: int = 14) -> Optional[float]:
+    if series is None or len(series) < window + 1:
+        return None
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=window).mean()
+    avg_loss = loss.rolling(window=window).mean()
+    # Avoid division by zero
+    rs = avg_gain / (avg_loss.replace(0, 1e-8))
+    rsi = 100 - (100 / (1 + rs))
+    return float(rsi.iloc[-1])
 
 
 # -------------------------
@@ -137,12 +167,12 @@ class YahooMostActiveScraper:
         self.wait = WebDriverWait(self.driver, wait_timeout)
         self.data: List[Dict] = []
         self.polite = polite
+        self._yf_cache: Dict[str, Dict] = {}
 
     def open_page(self, url: str):
         logger.info("Opening URL: %s", url)
         self.driver.get(url)
         self._wait_for_ready_state()
-        # small polite wait for dynamic content
         time.sleep(0.5 + random.random() * 0.5)
 
     def _wait_for_ready_state(self, timeout: int = 10):
@@ -152,15 +182,12 @@ class YahooMostActiveScraper:
             logger.warning("Page did not reach readyState 'complete' within timeout")
 
     def _find_table_and_headers(self):
-        # wait for table presence
         try:
             table = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
         except TimeoutException:
             raise RuntimeError("No table found on the page")
-        # find headers
         header_elems = table.find_elements(By.CSS_SELECTOR, "thead th")
         headers = [h.text.strip() for h in header_elems]
-        # mapping header name (lowercase) -> index
         header_map = {}
         for idx, h in enumerate(headers):
             key = h.lower()
@@ -173,15 +200,13 @@ class YahooMostActiveScraper:
         for row in rows:
             try:
                 cells = row.find_elements(By.TAG_NAME, "td")
-                # safe-get helper
+
                 def g(idx):
                     try:
                         return _clean_text(cells[idx].text)
                     except Exception:
                         return None
 
-                # Attempt to find by common header names (fallback to indices if present)
-                # The header_map keys are whole header text lowercased; we check substrings for robustness
                 def find_index_by_keyword(keywords):
                     for k, idx in header_map.items():
                         for kw in keywords:
@@ -197,7 +222,6 @@ class YahooMostActiveScraper:
                 marketcap_idx = find_index_by_keyword(["market cap", "marketcap"]) or None
                 pe_idx = find_index_by_keyword(["pe", "pe ratio"]) or None
 
-                # Build record gracefully
                 symbol = g(symbol_idx) if symbol_idx is not None else None
                 name = g(name_idx) if name_idx is not None else None
                 price_raw = g(price_idx) if price_idx is not None else None
@@ -217,12 +241,10 @@ class YahooMostActiveScraper:
                     "scraped_at": datetime.utcnow().isoformat() + "Z",
                 }
 
-                # parsed numeric values
                 record["price_usd"] = parse_price(price_raw) if price_raw else None
                 record["change"] = parse_change(change_raw) if change_raw else None
                 record["volume"] = parse_number_with_suffix(volume_raw) if volume_raw else None
                 record["market_cap"] = parse_number_with_suffix(marketcap_raw) if marketcap_raw else None
-                # PE ratio may contain '-' for N/A
                 try:
                     record["pe_ratio"] = float(pe_raw.replace(",", "")) if pe_raw and pe_raw not in {"-", "—", "N/A"} else None
                 except Exception:
@@ -235,17 +257,12 @@ class YahooMostActiveScraper:
         return page_records
 
     def _click_next_if_available(self) -> bool:
-        """
-        Return True if we clicked next and more pages are expected; False if Next is absent/disabled.
-        """
-        # There may be a pagination control under a div with buttons; try common attributes for Next
         try:
             next_btn = self.driver.find_element(By.XPATH, "//button[contains(@aria-label,'Next') or contains(., 'Next')]")
         except NoSuchElementException:
             logger.info("Next button not found on page.")
             return False
 
-        # check if disabled
         disabled_attr = next_btn.get_attribute("disabled")
         classes = (next_btn.get_attribute("class") or "")
         aria_disabled = next_btn.get_attribute("aria-disabled")
@@ -253,10 +270,8 @@ class YahooMostActiveScraper:
             logger.info("Next button is disabled - reached last page.")
             return False
 
-        # attempt to click with retry
         try:
             next_btn.click()
-            # wait a bit for the next page to load content
             self._wait_for_ready_state()
             time.sleep(0.5 + random.random() * 0.7)
             return True
@@ -272,10 +287,6 @@ class YahooMostActiveScraper:
                 return False
 
     def scrape(self, pages_limit: Optional[int] = None):
-        """
-        Scrape pages until Next disabled or until pages_limit is reached (if provided).
-        """
-        # Open the target page
         self.open_page(self.MOST_ACTIVE_URL)
 
         pages_scraped = 0
@@ -296,12 +307,80 @@ class YahooMostActiveScraper:
                 logger.info("Reached pages_limit (%s). Stopping.", pages_limit)
                 break
 
-            # Try to move to the next page
             has_next = self._click_next_if_available()
             if not has_next:
                 break
 
         logger.info("Scraping completed. Total rows collected: %d", len(self.data))
+
+    # -------------------------
+    # yFinance enrichment
+    # -------------------------
+    def _fetch_yf_data(self, symbol: str, period: str = "1y", interval: str = "1d") -> Dict:
+        """Fetch historical data for symbol and compute indicators. Results cached per-run."""
+        if not symbol:
+            return {}
+        if symbol in self._yf_cache:
+            return self._yf_cache[symbol]
+
+        result = {}
+        try:
+            logger.debug("Fetching yfinance data for %s", symbol)
+            tk = yf.Ticker(symbol)
+            info = tk.info if hasattr(tk, "info") else {}
+            # attempt safe extractions
+            result["yf_market_cap"] = info.get("marketCap") if isinstance(info, dict) else None
+            result["yf_beta"] = info.get("beta") if isinstance(info, dict) else None
+            # trailingPE if available
+            result["yf_trailingPE"] = info.get("trailingPE") if isinstance(info, dict) else None
+
+            hist = tk.history(period=period, interval=interval, auto_adjust=False)
+            if hist is None or hist.empty:
+                logger.debug("No history for %s", symbol)
+                self._yf_cache[symbol] = result
+                return result
+
+            close = hist["Close"].dropna()
+            # compute SMA20, SMA50, SMA200
+            result["sma20"] = compute_sma(close, 20)
+            result["sma50"] = compute_sma(close, 50)
+            result["sma200"] = compute_sma(close, 200)
+            # bollinger
+            ma20, bb_upper, bb_lower = compute_bollinger(close, window=20, num_std=2)
+            result["bb_ma20"] = ma20
+            result["bb_upper"] = bb_upper
+            result["bb_lower"] = bb_lower
+            # rsi
+            result["rsi14"] = compute_rsi(close, window=14)
+
+        except Exception as e:
+            logger.debug("yfinance fetch failed for %s: %s", symbol, e)
+        finally:
+            self._yf_cache[symbol] = result
+            return result
+
+    def enrich_with_yfinance(self, delay: float = 1.0, period: str = "1y", interval: str = "1d"):
+        """Enrich collected records with yfinance-derived fields. This is optional and
+        slow for many tickers; respects a delay between requests to be polite.
+        """
+        if not self.data:
+            logger.warning("No scraped data to enrich.")
+            return
+
+        logger.info("Enriching %d records via yfinance (delay=%s) ...", len(self.data), delay)
+        for i, rec in enumerate(self.data, start=1):
+            sym = rec.get("symbol")
+            try:
+                yf_data = self._fetch_yf_data(sym, period=period, interval=interval)
+                rec.update(yf_data)
+            except Exception:
+                logger.exception("Failed to enrich %s", sym)
+            # polite delay
+            time.sleep(delay + random.random() * 0.3)
+            if i % 20 == 0:
+                logger.info("Enriched %d/%d", i, len(self.data))
+
+        logger.info("Enrichment completed.")
 
     def save(self, output_basename: str):
         if not self.data:
@@ -313,21 +392,25 @@ class YahooMostActiveScraper:
         csv_path = f"{output_basename}_{timestamp}.csv"
         json_path = f"{output_basename}_{timestamp}_raw.json"
 
-        # reorder columns sensibly
+        # sensible column ordering: include new yfinance columns if present
         cols = [
             "scraped_at", "symbol", "name",
             "price_raw", "price_usd",
             "change_raw", "change",
             "volume_raw", "volume",
             "market_cap_raw", "market_cap",
-            "pe_raw", "pe_ratio"
+            "pe_raw", "pe_ratio",
+            # yfinance enrichment
+            "yf_market_cap", "yf_beta", "yf_trailingPE",
+            "sma20", "sma50", "sma200",
+            "bb_ma20", "bb_upper", "bb_lower",
+            "rsi14",
         ]
         cols = [c for c in cols if c in df.columns] + [c for c in df.columns if c not in cols]
         df = df[cols]
 
         df.to_excel(excel_path, index=False)
         df.to_csv(csv_path, index=False)
-        # save raw json
         with open(json_path, "w", encoding="utf-8") as fh:
             json.dump(self.data, fh, ensure_ascii=False, indent=2)
 
@@ -339,6 +422,7 @@ class YahooMostActiveScraper:
 # -------------------------
 # CLI Entrypoint
 # -------------------------
+
 def build_driver(headless: bool = True, window_size: str = "1280,1024"):
     options = ChromeOptions()
     if headless:
@@ -346,22 +430,27 @@ def build_driver(headless: bool = True, window_size: str = "1280,1024"):
     options.add_argument(f"--window-size={window_size}")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    # options.add_argument("--disable-gpu")  # usually not necessary on modern chrome
     driver = webdriver.Chrome(options=options)
     return driver
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape Yahoo Finance - Most Active stocks")
+    parser = argparse.ArgumentParser(description="Scrape Yahoo Finance - Most Active stocks (enhanced)")
     parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
     parser.add_argument("--pages", type=int, default=None, help="Max pages to scrape (default: all)")
     parser.add_argument("--out", type=str, default="yahoo_most_active", help="Output filename base (no ext)")
+    parser.add_argument("--enrich", action="store_true", help="Enrich results using yfinance (slower)")
+    parser.add_argument("--yf-delay", type=float, default=1.0, help="Delay (seconds) between yfinance requests")
+    parser.add_argument("--yf-period", type=str, default="1y", help="Period for yfinance history (eg '6mo','1y')")
+    parser.add_argument("--yf-interval", type=str, default="1d", help="Interval for yfinance history (eg '1d')")
     args = parser.parse_args()
 
     driver = build_driver(headless=args.headless)
     try:
         scraper = YahooMostActiveScraper(driver, wait_timeout=12)
         scraper.scrape(pages_limit=args.pages)
+        if args.enrich:
+            scraper.enrich_with_yfinance(delay=args.yf_delay, period=args.yf_period, interval=args.yf_interval)
         scraper.save(args.out)
     except Exception:
         logger.exception("Unhandled exception during scraping.")
